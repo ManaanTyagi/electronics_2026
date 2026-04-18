@@ -1,148 +1,157 @@
 /*
   WIRELESS E-STOP - RECEIVER (RX)
-  Hardware : ESP32 + Relay Module + Contactor
-  Protocol : ESP-NOW
-  Behavior : Relay stays ENERGIZED (contactor ON = system running).
-             Relay DE-ENERGIZES (contactor OFF = STOP) when:
-               1. E-Stop button is pressed on TX
-               2. Heartbeat signal is lost for > 500ms (fail-safe)
-  Wiring   : Relay IN pin -> RELAY_PIN
-             Use relay NC (Normally Closed) terminal to contactor coil
-             so power cut = contactor opens = machine stops
+  Behavior : Receives heartbeat and continuous counter.
+  Prints received numbers and current E-Stop state to Serial.
 */
 
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h> // Added for Long Range mode
 
-#define RELAY_PIN          5    // Relay control pin
-#define LED_GREEN         25    // Green = system running
-#define LED_RED           26    // Red   = E-Stop active
-#define RESET_BUTTON_PIN  18    // Physical reset button on receiver side
+#define RELAY_PIN              5   // Relay control pin
+#define LED_GREEN              25  // Green = system running
+#define LED_RED                26  // Red   = E-Stop active
+#define RESET_BUTTON_PIN       18  // Physical reset button on receiver
+#define LOCAL_HARDWARE_ESTOP   17  // Connect to 3.3V to trigger E-Stop locally on rover side
 
-// How long (ms) without a heartbeat before E-Stop fires automatically
-#define HEARTBEAT_TIMEOUT 500
+#define HEARTBEAT_TIMEOUT     500  // ms before heartbeat loss triggers E-Stop
 
-// Message structure - must match TX exactly
+// Message structure - MUST MATCH TX EXACTLY
 typedef struct {
   bool estop;
   bool heartbeat;
+  bool hwEstop;
+  long counter;    // Changed to long to match TX
 } EStopMessage;
 
 EStopMessage inMsg;
-volatile bool estopActive    = false;
+volatile bool estopActive         = false;
+volatile bool hwEstopActive       = false;
 volatile unsigned long lastHeartbeat = 0;
 
-// ----------------------------------------------------------
-// Relay helpers
-// Most relay modules are ACTIVE LOW (LOW = energized)
-// Adjust if your module is active HIGH
-// ----------------------------------------------------------
 void relayON() {
-  digitalWrite(RELAY_PIN, LOW);   // Energize relay -> contactor ON -> machine RUNS
+  digitalWrite(RELAY_PIN, LOW);
 }
 
 void relayOFF() {
-  digitalWrite(RELAY_PIN, HIGH);  // De-energize relay -> contactor OFF -> machine STOPS
-}
-
-// Callback: fires when a message is received via ESP-NOW
-void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len != sizeof(EStopMessage)) return;  // Ignore malformed packets
-
-  memcpy(&inMsg, data, sizeof(inMsg));
-  lastHeartbeat = millis();  // Reset heartbeat timer on every valid packet
-
-  if (inMsg.estop) {
-    estopActive = true;  // Latch E-Stop
-    Serial.println("!!! E-STOP RECEIVED FROM TX !!!");
-  }
+  digitalWrite(RELAY_PIN, HIGH);
 }
 
 void triggerEStop(const char *reason) {
+  if (!estopActive) { // Only print the trigger reason once
+    Serial.print("\n!!! E-STOP TRIGGERED: ");
+    Serial.println(reason);
+  }
   estopActive = true;
   relayOFF();
   digitalWrite(LED_RED,   HIGH);
   digitalWrite(LED_GREEN, LOW);
-  Serial.print("E-STOP ACTIVE: ");
-  Serial.println(reason);
+}
+
+// Callback for ESP32 Core v3.x
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(EStopMessage)) return;
+  memcpy(&inMsg, data, sizeof(inMsg));
+  lastHeartbeat = millis();
+
+  // Print incoming data continuously
+  Serial.print("RX | System State: ");
+  Serial.print(estopActive ? "TRIGGERED" : "RUNNING  ");
+  Serial.print(" | Received Counter: ");
+  Serial.println(inMsg.counter);
+
+  if (inMsg.hwEstop && !estopActive) {
+    triggerEStop("TX HARDWARE PIN TRIGGERED");
+    hwEstopActive = true;
+  }
+
+  if (inMsg.estop && !estopActive) {
+    triggerEStop("TX BUTTON PRESSED");
+  }
 }
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(RELAY_PIN,        OUTPUT);
-  pinMode(LED_GREEN,        OUTPUT);
-  pinMode(LED_RED,          OUTPUT);
-  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RELAY_PIN,              OUTPUT);
+  pinMode(LED_GREEN,              OUTPUT);
+  pinMode(LED_RED,                OUTPUT);
+  pinMode(RESET_BUTTON_PIN,       INPUT_PULLUP);
+  pinMode(LOCAL_HARDWARE_ESTOP,   INPUT);
 
-  // Start safe - relay OFF until system is confirmed ready
   relayOFF();
-  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_RED,   HIGH);
+  digitalWrite(LED_GREEN, LOW);
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  // Print this ESP's MAC so you can put it in TX code
-  Serial.print("RX MAC Address: ");
-  Serial.println(WiFi.macAddress());
+  // --- NEW ADDITIONS FOR MAXIMUM RANGE ---
+  // Enable ESP32 Long Range (LR) Protocol to match Transmitter
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
+  // Force Maximum Transmit Power (19.5 dBm) for robust ACKs
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  // ---------------------------------------
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW Init FAILED. Halting.");
-    while (true);  // Halt - do not run without comms
+    while (true);
   }
 
   esp_now_register_recv_cb(onReceive);
 
-  // Wait for first heartbeat before enabling relay
   Serial.println("Waiting for TX heartbeat...");
   unsigned long waitStart = millis();
   while (lastHeartbeat == 0) {
     if (millis() - waitStart > 5000) {
       Serial.println("No TX found in 5s. Check TX power and MAC address.");
-      waitStart = millis();  // Keep waiting, print warning every 5s
+      waitStart = millis();
     }
     delay(100);
   }
 
-  // TX confirmed - system ready
   estopActive = false;
   relayON();
   digitalWrite(LED_RED,   LOW);
   digitalWrite(LED_GREEN, HIGH);
-  Serial.println("RX Ready - System Armed and Running");
+  Serial.println("RX Ready - LR Mode Enabled - System Armed and Running");
 }
 
 void loop() {
-  // -------------------------------------------------------
-  // FAIL-SAFE: Heartbeat timeout check
-  // If TX goes offline, battery dies, or signal lost -> STOP
-  // -------------------------------------------------------
+
+  // Check LOCAL hardware E-Stop
+  if (digitalRead(LOCAL_HARDWARE_ESTOP) == HIGH && !estopActive) {
+    triggerEStop("LOCAL HARDWARE PIN ON ROVER TRIGGERED");
+    hwEstopActive = true;
+  }
+
+  // FAIL-SAFE: Heartbeat timeout
   if (!estopActive && (millis() - lastHeartbeat > HEARTBEAT_TIMEOUT)) {
     triggerEStop("HEARTBEAT LOST - TX offline or out of range");
   }
 
-  // -------------------------------------------------------
-  // E-Stop is LATCHED - physical reset button required
-  // Press RESET_BUTTON_PIN to re-arm (ensures human confirms)
-  // -------------------------------------------------------
+  // E-Stop LATCH Reset Logic
   if (estopActive) {
     relayOFF();
     digitalWrite(LED_RED,   HIGH);
     digitalWrite(LED_GREEN, LOW);
 
-    // Check if reset button is pressed AND heartbeat is healthy
-    bool resetPressed    = (digitalRead(RESET_BUTTON_PIN) == LOW);
+    bool resetPressed     = (digitalRead(RESET_BUTTON_PIN)     == LOW);
     bool heartbeatHealthy = (millis() - lastHeartbeat < HEARTBEAT_TIMEOUT);
+    bool txEstopCleared   = (!inMsg.estop && !inMsg.hwEstop);
+    bool localPinClear    = (digitalRead(LOCAL_HARDWARE_ESTOP) == LOW);
 
-    if (resetPressed && heartbeatHealthy && !inMsg.estop) {
-      // Safe to reset: TX is alive and E-Stop button is released
-      estopActive = false;
+    if (resetPressed && heartbeatHealthy && txEstopCleared && localPinClear) {
+      estopActive   = false;
+      hwEstopActive = false;
       relayON();
       digitalWrite(LED_RED,   LOW);
       digitalWrite(LED_GREEN, HIGH);
-      Serial.println("System RESET - Running");
+      Serial.println("\nSystem RESET - Running");
+    } else if (resetPressed) {
+      Serial.println("\nReset BLOCKED. Ensure all E-Stops are released and TX is online.");
     }
   }
 
-  delay(50);  // Check at 20Hz
+  delay(50);
 }

@@ -28,7 +28,9 @@ Embedded_UGVC/
 ├── Estop/                     # Wireless Emergency Stop system via ESP-NOW
 │   ├── Estop_RX/              # Flashed into the rover's onboard ESP32 to controls the relay and contactor to cut power on estop trigger
 │   │
-│   └── Estop_TX/              # Flashed into the remote unit handles button input and transmits estop signal to rover
+│   ├── Estop_TX/              # Flashed into the remote unit handles button input and transmits estop signal to rover
+│   │
+│   └── MAC_ID                 # Flash this code in Esp first to find MAC_ID and then use it in TX code
 │
 └── README.md
 ```
